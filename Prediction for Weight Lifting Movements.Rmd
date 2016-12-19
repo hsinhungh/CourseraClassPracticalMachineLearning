@@ -1,0 +1,219 @@
+---
+title: "Prediction for Weight Lifting Movements"
+author: "Hsin-Hung Hsieh"
+date: "December 13, 2016"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Executive Summary
+
+The goal of this project is to build a model to learn from object movement tracking data to predict how well barbell lifting is performed.  Simple tree models are tried but do not perform well; they can achieve only 50% - 53% accuracy.  Random forest model works very well and yields 99.54% accuracy when applied on hold-out sample set.  The derived features of Euler angles provide significant predicting power to the model.
+
+
+## Background
+
+The goal of this project is to build a model to predict how well barbell lifting is performed.  6 participants were asked to perform weight lifting in 5 different ways: exactly according to the specification (Class A), throwing the elbows to the front (Class B), lifting the dumbbell only halfway (Class C), lowering the dumbbell only halfway (Class D) and throwing the hips to the front (Class E). We will use data collected from movement tracking devices (put on the belt, forearm, arm, and dumbbell) to classify/predict in which way the participant is performing.
+
+## Import, Split, and Clean Data
+
+The dataset is generously provided by the authors of the paper "Velloso, E.; Bulling, A.; Gellersen, H.; Ugulino, W.; Fuks, H. Qualitative Activity Recognition of Weight Lifting Exercises. Proceedings of 4th International Conference in Cooperation with SIGCHI (Augmented Human '13) . Stuttgart, Germany: ACM SIGCHI, 2013."  Read more information here (see the section on the Weight Lifting Exercise Dataset): <http://groupware.les.inf.puc-rio.br/har#ixzz4SnGSJIzG>.
+
+The movement class (A,B,C,D,E) is recorded in column 'classe' in the dataset. Most of the columns are different type of movement readings from the devices. There are also columns for participant names, timestamps, and row numbers.
+
+# Importing Data
+
+```{r message=FALSE, warning=FALSE}
+# loading required packages
+library(caret); library(data.table); library(rpart.plot)
+library(party); library(rattle); library(parallel); library(doSNOW)
+
+# set working directory
+setwd('C:\\Users\\hsinhung\\Documents\\Coursera\\Practical_ML_proj')
+
+# set up parallel processing to speed up model training
+cl <- makeCluster(2, type='SOCK')
+registerDoSNOW( cl )
+
+# Read training dataset into data.table
+dt_ori <- data.table(read.table(file='pml-training.csv',sep=',',header=T))
+```
+
+# Splitting Data into Training and Test sets
+
+Because there are sufficient amount of data (19622 observations), we decide to split data into training and test/validation sets: 80% observations going to training and 20% going to testing.
+
+```{r}
+dim(dt_ori)
+```
+
+
+```{r}
+set.seed(3456)
+trainIndex <- createDataPartition(dt_ori$classe, p = .8, list = FALSE, times = 1)
+dt_train <- dt_ori[ trainIndex,]  # training samples
+dt_test  <- dt_ori[ -trainIndex,] # hold-out testing samples
+```
+
+
+# Cleaning Data
+
+At a glance, this is a high-dimensional dataset with 160 variables (including the target column 'classe' ):
+
+```{r}
+dim(dt_train)
+```
+
+The authors of the dataset described in their paper <http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf> that additional derived features were computed using sliding window approach.  In the dataset column names with these prefixes were derived sliding-window features 'avg_', 'var_', 'stddev_', 'max_', 'min_', 'amplitude_', 'kurtosis_', 'skewness_'. These sliding window aggregate features are not suitable to be used in our project because their values are missing in most of the rows in the data.  Therefore we will eliminate these sliding-window features from the model.
+
+We will also eliminate columns for row numbers and participant names.  Timestamp and time window columns will also be dropped because they relate to sliding window features which were not needed in this study.
+
+```{r}
+# Removing unused columns for derived sliding-window values
+dt_train <- dt_train[,colnames(dt_train)[!grepl(pattern = '(avg_)|(var_)|(stddev_)|(max_)|(min_)|(amplitude_)|(kurtosis_)|(skewness_)', x = colnames(dt_train))],with=FALSE]
+
+# Removing unused columns for participant names and timestamps
+dt_train <- dt_train[,colnames(dt_train)[!grepl(pattern = '(X)|(user_name)|(timestamp)|(window)', x = colnames(dt_train))],with=FALSE]
+```
+
+After the cleaning, there are now more manageable 53 columns left (including the target 'classe' column):
+
+```{r}
+dim(dt_train)
+```
+
+## Exploratory Analysis
+
+The authors of the dataset described in their paper <http://groupware.les.inf.puc-rio.br/public/papers/2013.Velloso.QAR-WLE.pdf> that they calculated features on the Euler angles (roll, pitch, and yaw) for each device location (dumbbell, arm, forearm, and belt).  These calculated features represented some levels of aggregated information from all raw readings.  We are interested in learning if the interaction between these aggregated fields yield any useful pattern.  To reduce the complexity of the exploratory  plot we pick only rows for classe 'A' and 'D' and do a pair scatter plot on these 12 Euler angle fields.
+
+```{r cache=TRUE, fig.width=12, fig.height=14, warning=FALSE}
+# Exploratory Plotting
+library(AppliedPredictiveModeling)
+classe_to_plot = c('A','D')
+col_to_plot    = colnames(dt_train)[grepl(x = colnames(dt_train),pattern = '(roll)|(pitch)|(yaw)')]
+dtplotx = dt_train[classe %in% classe_to_plot, col_to_plot, with=FALSE]
+dtploty = dt_train[classe %in% classe_to_plot,]$classe
+transparentTheme(trans = .05)
+featurePlot(x = dtplotx, y = dtploty, plot = 'pairs', auto.key = list(columns = 5))
+```
+
+The result is fairly interesting.  The interactions between some fields seem to be able to differentiate class 'A' (red dots) from 'D' (black dots).  In many plots class 'A' dots scattered much more widely than class 'D' ones, and class 'D' seems to have only positive values in 'pitch_forearm' while class 'A' took both negative and positive values.  These identifiable patterns revealed by simple exploratory analysis gives some confidence that more sophisticated models should be able to pick up more complex patterns to achieve better predictions.
+
+
+## Simple rpart Tree Model
+
+We first fit a simple decision tree to further explore if there exist any more easily identifiable patterns. Repeated cross-validation (10-fold repeated 10 times) is used to estimate model performance.
+
+```{r cache=TRUE}
+set.seed(1001)
+# set up repeated cross-validation to find best model parameters:
+train_control <- trainControl(method='repeatedcv', number=10, repeats=10, savePredictions = TRUE)
+# fit a rpart model
+rpart_fit <- train(classe~.,method="rpart",data=dt_train,trControl=train_control)
+```
+
+This simple rpart tree model doesn't perform well. The best model parameter cp (complexity parameter) 0.036 yields unsatisfactory accuracy of 50.7%.
+
+```{r}
+rpart_fit
+```
+
+And from the tree plot it is clear that except for final node (3) and (4) in which class A and E are cleanly identified, all other nodes do not have dominating classes. Note that class D is not even identified by any nodes.
+
+```{r}
+fancyRpartPlot(rpart_fit$finalModel)
+```
+
+
+
+## Revised rpart Tree Model
+
+Many models tend to perform worse when highly correlated features exist in the dataset.  We try to identify highly correlated fields using 0.75 as the coefficient ratio cutoff.  20 fields were recommended to be removed:
+
+```{r cache=TRUE}
+# Removing highly correlated variables
+correlationMatrix <- cor(dt_train[,1:52,with=FALSE])
+highlyCorrelated <- findCorrelation(correlationMatrix, cutoff=0.75, names=TRUE)
+highlyCorrelated
+```
+
+We then remove these 20 highly correlated fields from the dataset and fit a tree model again.
+
+```{r cache=TRUE}
+set.seed(1002)
+# removing highly correlated fields
+dt_train_condensed <- dt_train[,colnames(dt_train)[!(colnames(dt_train) %in% highlyCorrelated)],with=FALSE]
+# set up repeated cross-validation to find best model parameters:
+train_control <- trainControl(method='repeatedcv', number=10, repeats=10, savePredictions = TRUE)
+# fit a rpart model
+rpart_fit2 <- train(classe~.,method="rpart",data=dt_train_condensed,trControl=train_control)
+```
+
+With best model parameter cp (complexity parameter) 0.028 this new attempt yields accuracy of 53.7%.  While some improvement has been achieved over last run, the result is still far from satisfactory. 
+
+```{r}
+rpart_fit2
+```
+
+This new tree model is able to predict all 5 classes, but it seems to struggle to correctly classify classe 'B','C', and 'D'.
+
+```{r fig.width=9, fig.height=6}
+fancyRpartPlot(rpart_fit2$finalModel)
+```
+
+
+## Random Forest Model
+
+Now we will fit a Random Forest model to hopefully see more predicting power. We will continue to use the condensed dataset (after removing the highly correlated variables) here because it shows some success in improving the performance of simple rpart tree model.  10-fold cross-validation is chosen to estimate the model accuracy as well as to select best parameter for the model.
+
+```{r cache=TRUE, warning=FALSE}
+set.seed(1003)
+train_control <- trainControl(method='cv', number=10, savePredictions = TRUE)
+rf_fit <- train(classe~.,method="rf",data=dt_train_condensed,trControl=train_control)
+save(rf_fit,file='robj_rf_fit')
+```
+
+The estimated accuracy of the random forest model is surprisingly high: 99.15% with mtry = 2 (randomly select 2 variables for each tree):
+
+```{r}
+#load('robj_rf_fit')
+rf_fit
+```
+
+When examining the importance of variables in the model, we found 6 out of the top 10 most important variables are the derived aggregated features of Euler angles (roll_, pitch_, and yaw_ variables).  This is consistent with our exploratory analysis in which identifiable patterns that differentiate classes are seen from the interactions of these Euler angle aggregates.
+
+```{r}
+plot(varImp(rf_fit))
+```
+
+
+We also look at the out-of-bag error estimate produced by random forest algorithm. It is very low: 0.65% indicating accuracy of 99.35%.  This is slightly more optimistic than the estimate from cross-validation, but these 2 accuracy estimates are close and consistent.
+
+```{r}
+rf_fit$finalModel
+```
+
+## Apply Model on Hold-out Samples
+
+We will now use the hold-out dataset (dt_test) to test the performance of the random forest model.  The test dataset will first be pre-processed in the same way training set went through:
+
+```{r}
+# Removing unused columns for derived sliding-window values
+dt_test <- dt_test[,colnames(dt_test)[!grepl(pattern = '(avg_)|(var_)|(stddev_)|(max_)|(min_)|(amplitude_)|(kurtosis_)|(skewness_)', x = colnames(dt_test))],with=FALSE]
+# Removing unused columns for paticipant names and timestamps
+dt_test <- dt_test[,colnames(dt_test)[!grepl(pattern = '(X)|(user_name)|(timestamp)|(window)', x = colnames(dt_test))],with=FALSE]
+```
+
+Making predictions and examining performance.  The prediction accuracy on hold-out samples is very satisfactory: 99.54%.
+
+```{r cache=TRUE}
+rf_predict <- predict(rf_fit,newdata = dt_test)
+confusionMatrix( rf_predict, dt_test$classe)
+```
+
+## Conclusions
+
+Random forest model works very well on this body-movement datasets.  Tested by hold-out samples, the model's prediction accuracy reaches 99.54%, slightly higher than both the estimation from cross-validation (99.15%) and out-of-bag estimate (99.35%). The high hold-out sample prediction accuracy supports the good performance of the model.  The consistent accuracy rates among hold-out sample predictions, cross-validation estimate, and out-of-bag accuracy estimates also show that cross-validation and out-of-bag accuracy estimates can reasonably predict the performance of models on unseen data.
